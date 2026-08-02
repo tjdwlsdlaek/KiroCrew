@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1604,35 +1605,34 @@ class TestRunAppBuild:
     @pytest.mark.asyncio
     async def test_requirements_only_uses_the_requirements_file(self, tmp_path, monkeypatch):
         (tmp_path / "requirements.txt").write_text("pytest\n", encoding="utf-8")
-        monkeypatch.setattr(registry.shutil, "which", lambda name: "/usr/bin/pip")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
-        assert spawned == [["/usr/bin/pip", "install", "-r", "requirements.txt"]]
+        assert spawned == [[sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]]
 
     @pytest.mark.asyncio
     async def test_pyproject_installs_the_project(self, tmp_path, monkeypatch):
         (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         (tmp_path / "requirements.txt").write_text("pytest\n", encoding="utf-8")
-        monkeypatch.setattr(registry.shutil, "which", lambda name: "/usr/bin/pip")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
-        assert spawned == [["/usr/bin/pip", "install", "."]]
+        assert spawned == [[sys.executable, "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
     async def test_setup_py_installs_the_project(self, tmp_path, monkeypatch):
         (tmp_path / "setup.py").write_text("from setuptools import setup\n", encoding="utf-8")
-        monkeypatch.setattr(registry.shutil, "which", lambda name: "/usr/bin/pip3")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
-        assert spawned == [["/usr/bin/pip3", "install", "."]]
+        assert spawned == [[sys.executable, "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
-    async def test_missing_pip_is_a_soft_skip(self, tmp_path, monkeypatch):
+    async def test_missing_path_pip_does_not_skip_the_python_build(self, tmp_path, monkeypatch):
+        """The Python build runs via ``sys.executable -m pip`` — the gateway's own
+        interpreter — so a host with no pip anywhere on PATH must still build."""
         (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         monkeypatch.setattr(registry.shutil, "which", lambda name: None)
-        log: list[str] = []
-        assert await registry._run_app_build(tmp_path, "demo", log) == {"ok": True}
-        assert any("pip not found on PATH" in line for line in log)
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert spawned == [[sys.executable, "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
     async def test_build_output_is_streamed_into_the_log(self, tmp_path, monkeypatch):
