@@ -2629,6 +2629,9 @@ async def start_dashboard(
     app.router.add_post("/api/chat/slots/import", session_transfer.api_chat_slot_import)
     app.router.add_get("/api/chat/slots/{slot}", chat.api_chat_slot_detail)
     app.router.add_get("/api/chat/slots/{slot}/summary", chat.api_chat_slot_summary)
+    app.router.add_get(
+        "/api/chat/slots/{slot}/source-links", chat.api_chat_slot_source_links
+    )
     app.router.add_post("/api/chat/slots/{slot}/stop", chat.api_chat_slot_stop)
     app.router.add_post("/api/chat/slots/{slot}/interrupt", chat.api_chat_slot_interrupt)
     app.router.add_post("/api/chat/slots/{slot}/end-wait", chat.api_chat_slot_end_wait)
