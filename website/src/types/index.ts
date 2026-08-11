@@ -490,6 +490,20 @@ export interface SessionLink {
    */
   direction: 'origin' | 'out' | 'both'
   live: boolean
+  /**
+   * The user disconnected this channel: turn output stops flowing there, but the
+   * binding is retained so a reply in that conversation resumes the same session.
+   * Distinct from `live`, which reports whether the transport *can* send at all —
+   * a disconnected channel on a healthy transport is still `live`.
+   *
+   * Set on every row including `origin`, because the conversation a session was
+   * born in can be disconnected too. `direction` records provenance only; it does
+   * not decide whether a row has a control.
+   *
+   * Optional because a browser holding a `slots` payload cached from before this
+   * field shipped has links without it; absent reads as connected.
+   */
+  paused?: boolean
 }
 
 export interface ConfiguredChannelTarget {

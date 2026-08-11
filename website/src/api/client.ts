@@ -1785,6 +1785,11 @@ export const api = {
   rewind: (slot: string, ts: string, content: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/rewind', { ts, content }).then(j),
   slackLink: (slot: string, channel?: string, threadTs?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/slack-link', (channel || threadTs) ? { ...(channel ? { channel } : {}), ...(threadTs ? { thread_ts: threadTs } : {}) } : undefined).then(j),
   unlinkSlack: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/slack-unlink').then(j),
+  // Sets whether turns reach the linked Slack thread. One call for both
+  // directions: a session born in its thread has no binding to re-establish, so
+  // reconnecting cannot go through slack-link.
+  pauseSlack: (slot: string, paused: boolean) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/slack-pause', { paused }).then(j),
+  pauseMirror: (slot: string, paused: boolean) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-pause', { paused }).then(j),
   channelTargets: () => fetch('/api/chat/channel-targets').then(j),
   linkMirror: (slot: string, channelType: string, targetId: string) => post(
     '/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-link',

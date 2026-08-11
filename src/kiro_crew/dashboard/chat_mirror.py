@@ -35,9 +35,10 @@ from kiro_crew.dashboard.chat_runner import _resolve_channel_target, _resolve_mi
 from kiro_crew.dashboard.chat_slack import list_slack_channels
 from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink
+from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink, is_channel_session_key
 from kiro_crew.messaging.renderer import chunk_text
 from kiro_crew.platform.context import redact_via_context
+from kiro_crew.platform.governance_profiles import vet_and_audit
 from kiro_crew.sel import sel
 from kiro_crew.session_map import ConversationOwnershipConflict
 
@@ -495,6 +496,100 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
     return web.json_response(
         {"ok": True, "channel_type": channel_type, "conversation_id": conversation_id}
     )
+
+
+async def api_chat_slot_mirror_pause(request: web.Request) -> web.Response:
+    """POST /api/chat/slots/{name}/mirror-pause — set whether turns reach the channel.
+
+    The channel-neutral twin of ``slack-pause``, and what the dashboard's single
+    row calls for a non-Slack channel. Body: ``{"paused": bool}``, defaulting to
+    ``true``; it sets a state in both directions for the same reason its Slack
+    counterpart does — a session BORN in a channel has no binding to re-establish,
+    so reconnecting cannot go through the link endpoint.
+
+    Two things qualify as something to disconnect: an explicit mirror binding, or
+    a session born in a channel, whose conversation is permanent. Requiring a
+    binding would leave a channel-born session rendering a row it could not
+    operate. ``409`` only when neither holds — answering ok would tell the UI it
+    disconnected something that was never connected.
+
+    The binding survives, so inbound routing is untouched and a reply still
+    resolves to THIS session; only the turn's outbound mirroring stops (see
+    ``chat_utils.mirror_is_paused`` for the exact scope). Written on the event
+    loop, matching the link writers in this module.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info.get("name") or request.match_info.get("slot", "")
+    slot = state.get_slot(name)
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    # Only an explicit boolean `false` connects; anything else disconnects, so
+    # ambiguous input fails toward the quiet side. Same rule as slack-pause.
+    paused = body.get("paused", True) is not False
+
+    session_key = effective_session_key(slot)
+    link = state.sessions.get_mirror_link(session_key)
+    explicit_mirror = link is not None and link.channel_type != SLACK_NAMESPACE
+    # A Slack-only session synthesizes a Slack ChannelLink from its dedicated
+    # fields, which would pass a bare None-check and then mute nothing. Slack is
+    # disconnected through its own endpoint; refusing here keeps the reply honest.
+    if not explicit_mirror and not is_channel_session_key(session_key):
+        return web.json_response({"error": "not linked", "code": "mirror_not_linked"}, status=409)
+
+    # Coerced for the same reason as the Slack path: this lands in the response
+    # body, so a non-bool from a stubbed manager would 500 at the JSON boundary.
+    was_paused = bool(state.sessions.set_mirror_paused(session_key, paused))
+
+    # Same courtesy note as the Slack thread, for the same reason and under the
+    # same governance: a conversation that simply goes quiet cannot be told from a
+    # stalled one. Only on the transition, and only when a send target actually
+    # resolves — a channel-born session with no explicit binding has nothing this
+    # path can address, and a missing note is better than a failed send.
+    if paused and not was_paused:
+        target = await asyncio.to_thread(_resolve_mirror_target, state, session_key)
+        if target is not None:
+            mirror_link, transport = target
+            note_permitted = False
+            try:
+                decision = await asyncio.to_thread(
+                    vet_and_audit,
+                    "channels",
+                    mirror_link.channel_type,
+                    session_key=session_key,
+                    tool_name="chat.mirror_disconnect_note",
+                    fail_closed=True,
+                )
+                note_permitted = bool(getattr(decision, "permitted", False))
+            except Exception:
+                logger.debug("disconnect note governance check failed", exc_info=True)
+                note_permitted = False
+            if note_permitted:
+                try:
+                    await transport.send_message(
+                        mirror_link.channel_id,
+                        "\U0001f50c _Disconnected — the conversation continues in the dashboard._",
+                        thread_id=mirror_link.thread_id,
+                    )
+                except Exception:
+                    logger.debug("disconnect note delivery failed", exc_info=True)
+
+    state.push_slots_update()
+    sel().log_api_access(
+        caller="dashboard",
+        operation="chat.mirror_pause" if paused else "chat.mirror_resume",
+        outcome="noop" if was_paused == paused else "success",
+        source="dashboard",
+        resources=slot.key,
+    )
+    logger.info("mirror-pause: %s paused=%s (was=%s)", slot.key, paused, was_paused)
+    return web.json_response({"ok": True, "was_paused": was_paused, "paused": paused})
 
 
 async def api_chat_slot_mirror_unlink(request: web.Request) -> web.Response:

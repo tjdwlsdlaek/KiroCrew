@@ -4595,9 +4595,17 @@ class DashboardState:
     def _slot_links(self, slot: _ChatSlot) -> tuple[list[dict[str, Any]], bool, str, str]:
         """Build the redacted channel-neutral link projection for one slot."""
         # circular import: chat imports state at module scope.
-        from kiro_crew.dashboard.chat_utils import effective_session_key
+        from kiro_crew.dashboard.chat_utils import (
+            effective_session_key,
+            mirror_is_paused,
+            slack_mirror_is_paused,
+        )
 
         session_key = effective_session_key(slot)
+        # Resolved once per slot rather than per row: both are storage reads, and
+        # a session holds at most one Slack thread and one mirror binding.
+        slack_paused = slack_mirror_is_paused(self, session_key)
+        mirror_paused = mirror_is_paused(self, session_key)
         mirror: ChannelLink | None = None
         persisted_ts: str | None = None
         persisted_channel: str | None = None
@@ -4651,6 +4659,15 @@ class DashboardState:
                     "target": _redacted_link_target(channel_id),
                     "direction": direction,
                     "live": self._channel_link_is_live(normalized),
+                    # Real on EVERY row, origin included: the conversation a
+                    # session was born in can be disconnected too, so it stops
+                    # syndicating there and the session carries on in the
+                    # dashboard. `direction` still records the provenance the
+                    # sidebar mark needs; it no longer decides whether the row
+                    # has a control.
+                    "paused": (
+                        slack_paused if channel_type == SLACK_NAMESPACE else mirror_paused
+                    ),
                 }
             )
 
@@ -4699,9 +4716,32 @@ class DashboardState:
                 "out",
             )
 
+        if genuine_slack and slack_origin_self_link:
+            # The conversation a session was BORN in gets a row too. Suppressing
+            # it was the last place a channel appeared with no control at all:
+            # you can stop a Slack-born session syndicating to its thread and
+            # carry on in the dashboard, and a human reply in that thread brings
+            # it back. It stays `origin` so the sidebar keeps showing where the
+            # conversation came from — provenance is history and survives a
+            # disconnect; only the delivery indicator reflects the mute.
+            append_link(ChannelLink(SLACK_NAMESPACE, slack_channel, slack_ts), "origin")
+
         if genuine_slack and not slack_origin_self_link:
             slack_namespace = _split_namespaced_channel_id(slack_channel)
             visible_slack_channel = slack_namespace[1] if slack_namespace else (slack_channel or "")
+            # A Slack ROW accompanies `slack_linked=True` unconditionally. The
+            # dashboard's channel control is built from `links` alone — it no
+            # longer synthesizes a Slack row from this boolean, because a
+            # synthesized row cannot know `paused` and so rendered a muted thread
+            # as connected. That makes a True here with no row worse than a
+            # cosmetic gap: the session IS linked and the menu would offer to
+            # connect it. Guaranteed here rather than left to hold incidentally
+            # across the branches above.
+            if not any(
+                row["channel"] == SLACK_NAMESPACE and row["direction"] != "origin"
+                for row in links
+            ):
+                append_link(ChannelLink(SLACK_NAMESPACE, slack_channel, slack_ts), "out")
             return links, True, visible_slack_channel, slack_ts or ""
         return links, False, "", ""
 
