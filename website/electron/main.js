@@ -1705,8 +1705,28 @@ function createTray() {
   const nightly = identityFamily(app.getVersion()) === "nightly";
   const iconFile = nightly && fs.existsSync(path.join(__dirname, "icon-nightly.png"))
     ? "icon-nightly.png" : "icon.png";
-  const iconPath = path.join(__dirname, iconFile);
-  const icon = nativeImage.createFromPath(iconPath).resize({ width: 18, height: 18 });
+  let icon;
+  const templatePath = path.join(__dirname, "trayTemplate.png");
+  if (IS_MAC && fs.existsSync(templatePath)) {
+    // macOS menu-bar icons are template images: a monochrome (black +
+    // alpha) glyph the system recolors for light/dark/tinted menu bars.
+    // Passing the full-colour icon here renders it as-is, which clashes
+    // with neighbouring status items and loses contrast on tinted bars.
+    // The asset ships at 18px with an @2x retina variant that
+    // createFromPath picks up via the DPI-suffix convention, so no
+    // resize. setTemplateImage is explicit even though the *Template
+    // filename convention already implies it. The stable and nightly
+    // glyphs share one silhouette (the channels differ only in field
+    // colour), so a single template asset serves both; channel identity
+    // stays on the Dock icon and app.name.
+    icon = nativeImage.createFromPath(templatePath);
+    icon.setTemplateImage(true);
+  } else {
+    // Other platforms render tray icons literally, so keep the
+    // channel-aware full-colour icon (nightly identity stays visible).
+    icon = nativeImage.createFromPath(path.join(__dirname, iconFile))
+      .resize({ width: 18, height: 18 });
+  }
   tray = new Tray(icon);
   tray.setToolTip(app.name);
   // Each connection opens as its own window on every platform (native window
