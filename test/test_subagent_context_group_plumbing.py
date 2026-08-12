@@ -177,6 +177,53 @@ class TestContinuationInheritsScope:
         assert captured["include_lessons"] is True
         assert captured["include_project"] is True
 
+    def test_continue_conversation_runs_where_the_run_ran(self, monkeypatch, tmp_path):
+        """A continuation must carry the run's cwd into spawn().
+
+        ``spawn`` resolves an empty cwd to the POOL project before it validates
+        the agent name, so a run spawned against a project-local agent came back
+        "unknown agent" — and every caller reads a non-busy error as unresumable
+        and respawns from the digest alone, dropping the conversation the call
+        exists to preserve. The run's cwd is recorded in its own state.json.
+        """
+        mgr = _mgr()
+        mgr._agents["conv3"] = SubagentInfo(id="conv3", task="t")
+        monkeypatch.setattr(mgr, "_conversation_busy", lambda _k: None)
+        monkeypatch.setattr(mgr._sessions, "resumable_sid", lambda _k: "sid-1")
+        monkeypatch.setattr(mgr, "_promote_conversation", lambda *_a: None)
+        proj = tmp_path / "alpha"
+        proj.mkdir()
+        monkeypatch.setattr(
+            "kiro_crew.subagent.read_state", lambda _id: {"cwd": str(proj)}
+        )
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(mgr, "spawn", lambda *_a, **kw: captured.update(kw))
+
+        mgr.continue_conversation("conv3", "follow up")
+        assert captured["cwd"] == str(proj)
+
+        # An explicit caller cwd wins over the recorded one.
+        captured.clear()
+        mgr.continue_conversation("conv3", "follow up", cwd="/proj/beta")
+        assert captured["cwd"] == "/proj/beta"
+
+        # A run with no recorded cwd resolves to spawn's own default.
+        monkeypatch.setattr("kiro_crew.subagent.read_state", lambda _id: {})
+        captured.clear()
+        mgr.continue_conversation("conv3", "follow up")
+        assert captured["cwd"] == ""
+
+        # A project that no longer exists must NOT be forwarded: spawn refuses a
+        # missing cwd outright, which would turn a resumable conversation into a
+        # hard failure. Fall back to the pool, as before this change.
+        monkeypatch.setattr(
+            "kiro_crew.subagent.read_state",
+            lambda _id: {"cwd": str(tmp_path / "deleted-project")},
+        )
+        captured.clear()
+        mgr.continue_conversation("conv3", "follow up")
+        assert captured["cwd"] == ""
+
 
 class TestScopePersistence:
     """The scope must be on disk from folder creation, not a later merge.

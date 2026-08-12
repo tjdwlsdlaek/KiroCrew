@@ -197,6 +197,35 @@ class TestBatchIdentity:
         assert "w2" not in mgr._seen_batches
         assert "w2" not in mgr._batch_submitted
 
+    def test_a_queued_run_cancelled_while_waiting_never_starts(self):
+        """`cancel()` marks the info terminal but cannot unqueue the spawn.
+
+        A run can be stopped WHILE it waits behind the stagger — a user stop, or a
+        session deleted out from under it. Draining it anyway would execute tools
+        for work already reported as stopped, so the drain skips it and moves on
+        to the next entry rather than dropping the whole drain.
+        """
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx())
+        stopped = SubagentInfo(id="q-stopped", task="cancelled while waiting")
+        stopped.user_stopped = True
+        mgr._agents["q-stopped"] = stopped
+        mgr._agents["q-live"] = SubagentInfo(id="q-live", task="still wanted")
+        mgr._queue = [
+            {"task": "cancelled while waiting", "_preassigned_id": "q-stopped"},
+            {"task": "still wanted", "_preassigned_id": "q-live"},
+        ]
+        mgr._running_count = 0
+        mgr._spawn_stagger_secs = 0.0
+        mgr._last_spawn_ts = 0.0
+        spawned: list[str] = []
+        mgr.spawn = lambda **kw: spawned.append(str(kw.get("_preassigned_id")))
+
+        mgr._drain_queue()
+
+        assert "q-stopped" not in spawned, "a cancelled queued run was started anyway"
+        assert spawned == ["q-live"], spawned
+        assert mgr._queue == []
+
     @pytest.mark.asyncio
     async def test_spawn_counts_submissions_once_per_member(self):
         """spawn() increments the submission counter exactly once per member —

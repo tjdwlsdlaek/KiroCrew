@@ -3262,8 +3262,15 @@ class SubagentManager:
         agent: str = "",
         model: str | None = None,
         max_turns: int = 0,
+        cwd: str = "",
+        _preassigned_id: str = "",
     ) -> SubagentInfo | None:
         """Dispatch a follow-up *task* into conversation *conv_id*.
+
+        ``_preassigned_id`` mirrors ``spawn``: a caller that must persist the
+        dispatch identity BEFORE the side effect (so a crash in between is
+        recoverable rather than ambiguous) supplies the id it already wrote
+        down, instead of discovering the minted one only on return.
 
         Retain-by-default: works on ANY completed run whose session files are
         still on disk — no keep flag needed at spawn time. Every run's sid /
@@ -3299,8 +3306,9 @@ class SubagentManager:
         # Seed the session map from the run's state.json when no mapping
         # exists yet (default runs never write one at spawn; the map is also
         # in-memory-lost across gateway restarts while state.json persists).
+        prior_state = read_state(conv_id) or {}
         if not self._sessions.resumable_sid(conv_key):
-            state = read_state(conv_id) or {}
+            state = prior_state
             sid = str(state.get("session_id") or "")
             if sid:
                 self._sessions.seed_conversation(
@@ -3340,13 +3348,38 @@ class SubagentManager:
         # The conversation TTL sweep / spawn_release owns deletion from here.
         self._promote_conversation(conv_id, conv_key)
         inc_memory, inc_lessons, inc_project = self._inherited_context_groups(conv_id)
+        # A continuation has to run WHERE THE RUN RAN. `spawn` resolves an empty
+        # cwd to the pool project before it validates the agent name, so a run
+        # spawned against a project-local agent (defined under that project's
+        # .kiro/agents/) came back "unknown agent" here — and the caller reads any
+        # non-busy error as unresumable and respawns from the digest alone,
+        # silently dropping the conversation this call exists to preserve. The
+        # run's own cwd is recorded in its state.json, which is the same place the
+        # session seed above comes from; an explicit caller cwd still wins.
+        #
+        # Only when it still EXISTS: a project can be moved or deleted while its
+        # conversation is resumable, and spawn refuses a missing cwd outright.
+        # Falling back to the pool keeps such a continuation working (it is only
+        # a project-local AGENT that then fails to resolve, which is the
+        # pre-existing behaviour) rather than converting it into a hard refusal.
+        effective_cwd = cwd
+        if not effective_cwd:
+            recorded = str(prior_state.get("cwd") or "")
+            if recorded:
+                try:
+                    if Path(recorded).is_dir():
+                        effective_cwd = recorded
+                except OSError:
+                    pass
         return self.spawn(
             task,
+            _preassigned_id=_preassigned_id,
             parent_session_key=parent_session_key,
             agent=agent,
             model=model,
             max_turns=max_turns,
             keep=True,
+            cwd=effective_cwd,
             conversation_key=conv_key,
             include_memory=inc_memory,
             include_lessons=inc_lessons,
@@ -3773,6 +3806,21 @@ class SubagentManager:
                 pass  # no running loop (sync/test context)
             return
         params = self._queue.pop(0)
+        # A run can be cancelled WHILE it waits here — a user stop, or a session
+        # deleted out from under it. Starting it anyway would execute tools for
+        # work already reported as stopped, so skip it and drain the next one
+        # instead: `cancel()` marks the info terminal but cannot unqueue this.
+        queued_id = str(params.get("_preassigned_id") or "")
+        if queued_id:
+            waiting = self._agents.get(queued_id)
+            if waiting is not None and (waiting.done or waiting.user_stopped or waiting.reaped):
+                logger.info("Skipping queued spawn %s: cancelled while waiting", queued_id)
+                self._emit_queue_depth(
+                    str(params.get("parent_session_key", "")), str(params.get("batch_id", ""))
+                )
+                if self._queue:
+                    self._drain_queue()
+                return
         logger.info(
             "Draining queue: spawning '%s' (%d left)",
             str(params.get("task", ""))[:40],

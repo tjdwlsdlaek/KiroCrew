@@ -24,6 +24,7 @@ from aiohttp import web
 import kiro_crew.dashboard.handlers as _h
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.config.paths import kiro_agents_dir
+from kiro_crew.crew_chat import CrewOrchestrator
 from kiro_crew.dashboard.handlers import kiro_usage_api
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
@@ -1177,6 +1178,19 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
         slot = state._slots.pop(normalized, None)
     if slot:
         pin_slot_keys.add(slot.key)
+    # Crew persists independently of the transcript, so a permanent delete has to
+    # reach into it too: its durable queue holds the user's own request texts and
+    # its dispatched subagents keep running whether or not a tab is open. Purging
+    # every candidate key rather than just the slot's, because the slot may already
+    # be gone (closed tab, restart) while the store on disk is not.
+    crew = getattr(state, "crew", None)
+    if isinstance(crew, CrewOrchestrator):
+        for candidate in pin_slot_keys:
+            try:
+                await crew.purge_slot(candidate)
+            except Exception:
+                logger.warning("History delete: crew purge failed for %s",
+                               candidate, exc_info=True)
     try:
         await state.remove_chat_pins_for_slots(pin_slot_keys)
     except Exception:
