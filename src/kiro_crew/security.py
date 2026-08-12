@@ -4419,6 +4419,27 @@ _WRITE_PROTECTED_HOME_PATHS += [
     f"{prefix}/apps/ops-mission-control/data/incidents/index.json"
     for prefix in _CREW_HOME_PREFIXES
 ]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # Issue Radar's repo config, for the same reason and with the same read/write
+    # asymmetry: it holds no secret and the app reads it on every request, but it
+    # carries TWO inputs to an authorization decision.
+    #
+    # ``repos[]`` is the connected-repo gate every route checks (``_connected``),
+    # so an agent that could write this file could connect a repository the user
+    # never chose and then drive the provider routes against it. And
+    # ``repos[].local_path`` is the checkout the dispatch gate validates, so a
+    # written path would make readiness report "ready" for a directory the user
+    # never selected — the gate would be vouching for the agent's own choice.
+    # A gate whose input the agent can author is the same defect as rendering a
+    # check that never ran as a check that passed. Found in review (GPT 5.6).
+    #
+    # The app's own store opens this path directly (``store.read_config`` /
+    # ``_config_lock``) and does not route through this gate, so connecting a repo
+    # and saving a checkout from the dashboard still work; only the agent's own
+    # file-edit and shell tools are refused.
+    f"{prefix}/apps/issue-radar/data/config.json"
+    for prefix in _CREW_HOME_PREFIXES
+]
 
 # ── Bash-layer protection for write-protected leaves ──
 # Leaf files under the crew home that a bash command must not be able to
