@@ -85,12 +85,32 @@ if [ "$1" = "api" ]; then
     exit 0
   fi
   if [ "${2:-}" = "--method" ] && [ "${3:-}" = "POST" ]; then
-    body="$(cat)"
+    # The status POST passes --input <file> (self-contained per retry
+    # attempt); the label POST still pipes --input - via stdin.
+    body=""
+    prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "--input" ] && [ "$arg" != "-" ]; then
+        body="$(cat "$arg")"
+      fi
+      prev="$arg"
+    done
+    if [ -z "$body" ]; then
+      body="$(cat)"
+    fi
     case "${4:-}" in
       *"/statuses/"*)
+        echo x >> "$FIXTURES/status_post_attempts.txt"
         if [ -f "$FIXTURES/fail_status" ]; then
           echo 'gh: Server Error (HTTP 500)' >&2
           exit 1
+        fi
+        if [ -f "$FIXTURES/fail_status_times" ]; then
+          attempts="$(wc -l < "$FIXTURES/status_post_attempts.txt")"
+          if [ "$attempts" -le "$(cat "$FIXTURES/fail_status_times")" ]; then
+            echo 'gh: Server Error (HTTP 500)' >&2
+            exit 1
+          fi
         fi
         printf '%s\n' "$body" > "$FIXTURES/published_status.json"
         exit 0
@@ -103,6 +123,26 @@ if [ "$1" = "api" ]; then
   fi
   case "${2:-}" in
     *"/issues/"*"/labels") cat "$FIXTURES/pr_labels.txt"; exit 0 ;;
+    *"/commits/"*"/status")
+      # The guarded retry's pre/retry reads: emit the CURRENT "PR
+      # Readiness" status id (gh applies --jq itself, so the stub emits
+      # the final value). Each read consumes the next line of
+      # status_ids.txt; the last line repeats once exhausted. No file or
+      # an empty line means no status exists yet.
+      echo x >> "$FIXTURES/status_get_attempts.txt"
+      if [ -f "$FIXTURES/status_ids.txt" ]; then
+        n="$(wc -l < "$FIXTURES/status_get_attempts.txt")"
+        total="$(wc -l < "$FIXTURES/status_ids.txt")"
+        if [ "$n" -gt "$total" ]; then n="$total"; fi
+        line="$(sed -n "${n}p" "$FIXTURES/status_ids.txt")"
+        if [ "$line" = "__FAIL__" ]; then
+          echo 'gh: Server Error (HTTP 500)' >&2
+          exit 1
+        fi
+        printf '%s\n' "$line"
+      fi
+      exit 0
+      ;;
   esac
 fi
 echo "gh stub: unhandled: $*" >&2
@@ -115,6 +155,15 @@ def _step(name: str) -> str:
     steps = spec["jobs"]["readiness"]["steps"]
     matches = [s["run"] for s in steps if s.get("name") == name and "run" in s]
     assert len(matches) == 1, f"expected exactly one {name!r} step, got {len(matches)}"
+    return matches[0]
+
+
+def _helper_script() -> str:
+    """The retry-helper install step every other step sources at runtime."""
+    spec = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    steps = spec["jobs"]["readiness"]["steps"]
+    matches = [s["run"] for s in steps if "run" in s and "cat > \"$RUNNER_TEMP/gh-retry.sh\"" in s["run"]]
+    assert len(matches) == 1, "expected exactly one retry-helper install step"
     return matches[0]
 
 
@@ -178,6 +227,14 @@ class Runner:
         (self.tmp / "pr-readiness-summary.md").write_text("## summary\n")
         self.summary = root / "step-summary.md"
         self.summary.write_text("")
+        # The steps under test `source "$RUNNER_TEMP/gh-retry.sh"`; in CI the
+        # first job step writes it there. Reproduce that provisioning here.
+        subprocess.run(  # noqa: S603 - fixed argv, workflow-authored script
+            ["bash", "-c", _helper_script()],
+            env={**os.environ, "RUNNER_TEMP": str(self.tmp)},
+            check=True,
+            capture_output=True,
+        )
         self.env = {
             **os.environ,
             "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
@@ -207,6 +264,8 @@ class Runner:
         fail_label_delete: bool = False,
         fail_label_create: bool = False,
         fail_status: bool = False,
+        fail_status_times: int = 0,
+        status_ids: tuple[str, ...] | None = None,
     ) -> Result:
         (self.fixtures / "head_sha.txt").write_text(head_sha + "\n")
         (self.fixtures / "pr_labels.txt").write_text("\n".join(pr_labels) + "\n")
@@ -220,6 +279,16 @@ class Runner:
             flag.unlink(missing_ok=True)
             if on:
                 flag.write_text("1")
+        times_flag = self.fixtures / "fail_status_times"
+        times_flag.unlink(missing_ok=True)
+        if fail_status_times:
+            times_flag.write_text(str(fail_status_times))
+        ids_flag = self.fixtures / "status_ids.txt"
+        ids_flag.unlink(missing_ok=True)
+        if status_ids is not None:
+            ids_flag.write_text("\n".join(status_ids) + "\n")
+        (self.fixtures / "status_post_attempts.txt").unlink(missing_ok=True)
+        (self.fixtures / "status_get_attempts.txt").unlink(missing_ok=True)
         for stale in ("calls.txt", "deleted.txt", "added.txt", "published_status.json"):
             (self.fixtures / stale).unlink(missing_ok=True)
 
@@ -311,6 +380,17 @@ def test_the_verdict_is_published_before_any_label_call(runner: Runner) -> None:
 # ── But a real failure must still be a failure ───────────────────────────────
 
 
+def test_a_deferred_evaluation_publishes_nothing(runner: Runner) -> None:
+    """A truncated evaluation that deferred to an existing terminal verdict
+    emits an empty status_state; the publish step must no-op green -- no
+    status POST, no label churn."""
+    result = runner.run(status_state="")
+    assert result.ok, result.proc.stderr
+    assert result.published is None
+    attempts_file = runner.fixtures / "status_post_attempts.txt"
+    assert not attempts_file.exists()
+
+
 def test_a_failure_to_publish_the_verdict_fails_the_step(runner: Runner) -> None:
     """The tolerance is scoped to the advisory labels, not to the verdict.
 
@@ -320,6 +400,85 @@ def test_a_failure_to_publish_the_verdict_fails_the_step(runner: Runner) -> None
     result = runner.run(fail_status=True)
     assert not result.ok
     assert result.published is None
+
+
+def test_a_transient_status_post_failure_is_retried_when_no_verdict_exists(
+    runner: Runner,
+) -> None:
+    """One 500 then success, no status on the SHA yet: the retry closes the
+    fresh-SHA no-status gap (the sweep skips SHAs with no status at all)."""
+    result = runner.run(fail_status_times=1)
+    assert result.ok, result.proc.stderr
+    assert result.published is not None
+    attempts = (runner.fixtures / "status_post_attempts.txt").read_text()
+    assert len(attempts.splitlines()) == 2
+
+
+def test_a_prior_runs_status_does_not_suppress_the_retry(
+    runner: Runner,
+) -> None:
+    """Nearly every SHA is evaluated more than once (pull_request_target,
+    then workflow_run re-evaluations), so a PRIOR run's status is almost
+    always present. That alone must not suppress the retry: a fresh red
+    replacing a stale green is exactly the write that must not be lost.
+    The status id is UNCHANGED across the failure, so the retry fires."""
+    result = runner.run(fail_status_times=1, status_ids=("100", "100"))
+    assert result.ok, result.proc.stderr
+    assert result.published is not None
+    attempts = (runner.fixtures / "status_post_attempts.txt").read_text()
+    assert len(attempts.splitlines()) == 2
+
+
+def test_a_lost_response_never_overwrites_an_intervening_verdict(
+    runner: Runner,
+) -> None:
+    """POST fails and the 'PR Readiness' status id CHANGED between the
+    pre-POST snapshot and the retry read: a write landed in between (ours
+    whose response was lost, or a concurrent run's newer verdict). The
+    retry must not fire -- re-POSTing could republish a stale verdict over
+    the newer one -- and the step succeeds."""
+    result = runner.run(fail_status=True, status_ids=("100", "200"))
+    assert result.ok, result.proc.stderr
+    # Exactly one POST: the failed original, no retry.
+    attempts = (runner.fixtures / "status_post_attempts.txt").read_text()
+    assert len(attempts.splitlines()) == 1
+
+
+def test_the_backoff_precedes_the_guard_read(publish_script: str) -> None:
+    """A write landing DURING the backoff sleep must be seen by the guard,
+    so the sleep must come before the id read that gates each retry. The
+    line-consuming stub cannot observe relative timing, so this is a
+    structural assertion on the retry loop's source order."""
+    loop = publish_script[publish_script.index("for attempt in 2 3"):]
+    assert loop.index("sleep") < loop.index('cur_id="$(readiness_status_id)"')
+
+
+def test_a_failed_guard_read_never_permits_a_blind_retry(
+    runner: Runner,
+) -> None:
+    """If the retry-time id read fails, the guard cannot know whether a
+    newer verdict landed -- a blind POST could overwrite it. The attempt is
+    skipped; with every read failing after a valid empty baseline, all
+    retries are skipped and the step fails loud rather than guessing."""
+    result = runner.run(
+        fail_status=True, status_ids=("", "__FAIL__", "__FAIL__")
+    )
+    assert not result.ok
+    attempts = (runner.fixtures / "status_post_attempts.txt").read_text()
+    assert len(attempts.splitlines()) == 1
+
+
+def test_a_failed_baseline_with_a_verdict_present_fails_loud(
+    runner: Runner,
+) -> None:
+    """Baseline read failed and a verdict exists at retry time: it could be
+    ours (response lost) or a stale prior run's. Trusting it silently could
+    leave a stale green; overwriting it could lose a newer red. The step
+    fails loud so a human (or the next run) resolves it."""
+    result = runner.run(fail_status=True, status_ids=("__FAIL__", "100"))
+    assert not result.ok
+    attempts = (runner.fixtures / "status_post_attempts.txt").read_text()
+    assert len(attempts.splitlines()) == 1
 
 
 def test_an_unexpected_label_error_still_fails_the_step(
